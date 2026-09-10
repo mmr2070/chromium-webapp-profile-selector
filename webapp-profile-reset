@@ -1,0 +1,125 @@
+#!/bin/bash
+# Reset tool for webapp-profile-selector
+
+CONFIG_FILE="$HOME/.config/webapp-profile-selector/config.json"
+USER_DESKTOP="$HOME/.local/share/applications/chromium.desktop"
+SYS_DESKTOP="/usr/share/applications/chromium.desktop"
+WRAPPER_BIN="$HOME/.local/bin/chromium-webapp-wrapper"
+
+if [[ "$1" == "--status" ]]; then
+  echo "Chromium Webapp Profile Selector"
+  
+  ok=true
+  if [[ ! -f "$USER_DESKTOP" ]]; then echo "[FAIL] User desktop override missing"; ok=false; fi
+  if [[ ! -f "$SYS_DESKTOP" ]]; then echo "[FAIL] System Chromium desktop missing"; ok=false; fi
+  if [[ ! -x "$WRAPPER_BIN" ]]; then echo "[FAIL] Wrapper script missing or not executable"; ok=false; fi
+  if ! command -v uwsm-app &> /dev/null; then echo "[FAIL] uwsm-app not found"; ok=false; fi
+  if ! command -v gum &> /dev/null; then echo "[FAIL] gum not found"; ok=false; fi
+  if ! command -v jq &> /dev/null; then echo "[FAIL] jq not found"; ok=false; fi
+  
+  if grep -q "Exec=chromium-webapp-wrapper" "$USER_DESKTOP" 2>/dev/null; then
+    interception="ACTIVE"
+  else
+    interception="INACTIVE"
+    ok=false
+  fi
+
+  config_status="OK"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    if ! jq -e '.webapps | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+      config_status="MALFORMED JSON OR MISSING .webapps OBJECT"
+      ok=false
+    fi
+  else
+    config_status="NOT FOUND (Will be created automatically)"
+  fi
+  
+  if [[ "$ok" == true ]]; then
+    echo "Status: OK"
+  else
+    echo "Status: NEEDS REPAIR"
+  fi
+  
+  echo ""
+  echo "Desktop entry:"
+  echo "  $USER_DESKTOP"
+  echo "System desktop entry:"
+  echo "  $SYS_DESKTOP"
+  echo "Wrapper:"
+  echo "  $WRAPPER_BIN"
+  echo "Configuration ($config_status):"
+  echo "  $CONFIG_FILE"
+  echo ""
+  echo "Webapp interception: $interception"
+  exit 0
+fi
+
+if [[ "$1" == "--repair" ]]; then
+  echo "Repairing interception override..."
+  if [[ ! -f "$SYS_DESKTOP" ]]; then
+    echo "Error: System Chromium desktop entry not found at $SYS_DESKTOP"
+    exit 1
+  fi
+  
+  mkdir -p "$(dirname "$USER_DESKTOP")"
+  cp -p "$SYS_DESKTOP" "$USER_DESKTOP"
+  
+  # Atomically update Exec= lines to point to our wrapper
+  tmp_file=$(mktemp)
+  awk '
+  /^Exec=/ {
+      sub(/^Exec=(\/usr\/bin\/)?chromium/, "Exec=chromium-webapp-wrapper")
+      print
+      next
+  }
+  { print }
+  ' "$USER_DESKTOP" > "$tmp_file"
+  mv "$tmp_file" "$USER_DESKTOP"
+  
+  # Refresh application database cache if the command exists
+  if command -v update-desktop-database &> /dev/null; then
+    update-desktop-database "$(dirname "$USER_DESKTOP")" 2>/dev/null || true
+  fi
+  
+  echo "Repair complete. Run with --status to verify."
+  exit 0
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]] || ! jq -e '.webapps | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+  gum style --foreground 3 "No valid configuration found. Nothing to reset."
+  exit 0
+fi
+
+clear
+CHOICE=$(gum choose --header "Select reset option:" "Reset Specific Webapp" "Reset Entire Plugin")
+
+if [[ -z "$CHOICE" ]]; then
+  exit 0
+fi
+
+if [[ "$CHOICE" == "Reset Specific Webapp" ]]; then
+  mapfile -t WEBAPPS < <(jq -r '.webapps | keys[]' "$CONFIG_FILE" 2>/dev/null)
+  if [[ ${#WEBAPPS[@]} -eq 0 ]]; then
+    gum style --foreground 3 "No webapps saved."
+    exit 0
+  fi
+  
+  SELECTED_APP=$(gum choose --header "Select webapp to reset (URL or Name):" "${WEBAPPS[@]}")
+  if [[ -n "$SELECTED_APP" ]]; then
+    tmp_file=$(mktemp)
+    if jq --arg key "$SELECTED_APP" 'del(.webapps[$key])' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$CONFIG_FILE"
+      gum style --foreground 2 "Reset profile assignment for $SELECTED_APP"
+    else
+      rm -f "$tmp_file"
+    fi
+  fi
+else
+  gum style --foreground 9 "Are you sure? This will remove all saved webapp -> profile assignments."
+  if gum confirm --affirmative="Reset Everything" --negative="Cancel"; then
+    tmp_file=$(mktemp)
+    echo '{"webapps": {}}' > "$tmp_file"
+    mv "$tmp_file" "$CONFIG_FILE"
+    gum style --foreground 2 "All webapp profile assignments have been reset."
+  fi
+fi

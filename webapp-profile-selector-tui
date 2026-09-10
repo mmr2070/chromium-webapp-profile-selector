@@ -1,0 +1,110 @@
+#!/bin/bash
+# TUI for selecting chromium profile
+
+WEBAPP_NAME="$1"
+WEBAPP_KEY="$2"
+shift 2
+
+declare -a EXTRA_ARGS=("$@")
+
+LOCAL_STATE="$HOME/.config/chromium/Local State"
+
+launch_app() {
+  local profile_dir="$1"
+  if [[ -n "$profile_dir" ]]; then
+    exec setsid uwsm-app -- /usr/bin/chromium --profile-directory="$profile_dir" "${EXTRA_ARGS[@]}" </dev/null >/dev/null 2>&1
+  else
+    exec setsid uwsm-app -- /usr/bin/chromium "${EXTRA_ARGS[@]}" </dev/null >/dev/null 2>&1
+  fi
+}
+
+if [[ ! -f "$LOCAL_STATE" ]]; then
+  gum style --foreground 9 "Error: Chromium could not be found." "Please verify that Chromium is installed correctly."
+  sleep 3
+  exit 1
+fi
+
+CONFIG_FILE="$HOME/.config/webapp-profile-selector/config.json"
+mkdir -p "$(dirname "$CONFIG_FILE")"
+
+init_config() {
+  local tmp_file
+  tmp_file=$(mktemp)
+  echo '{"webapps": {}}' > "$tmp_file"
+  mv "$tmp_file" "$CONFIG_FILE"
+}
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  if ! jq -e '.webapps | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    bak_file=$(mktemp "${CONFIG_FILE}.bak.XXXXXX")
+    cp -p "$CONFIG_FILE" "$bak_file" 2>/dev/null
+    init_config
+  fi
+else
+  init_config
+fi
+
+SAVED_PROFILE=$(jq -r --arg key "$WEBAPP_KEY" '.webapps[$key].profile // empty' "$CONFIG_FILE" 2>/dev/null)
+if [[ -n "$SAVED_PROFILE" ]]; then
+  PROFILE_EXISTS=$(jq -r --arg p "$SAVED_PROFILE" '.profile.info_cache | has($p)' "$LOCAL_STATE" 2>/dev/null)
+  if [[ "$PROFILE_EXISTS" != "true" ]]; then
+    gum style --foreground 3 "Saved profile for $WEBAPP_NAME is no longer available." "Please select another Chromium profile."
+    sleep 2
+    tmp_file=$(mktemp)
+    if jq --arg key "$WEBAPP_KEY" 'del(.webapps[$key])' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$CONFIG_FILE"
+    else
+      rm -f "$tmp_file"
+    fi
+  fi
+fi
+
+mapfile -t PROFILES < <(jq -r '.profile.info_cache | to_entries[] | "\(.key)|\(.value.name)"' "$LOCAL_STATE" 2>/dev/null)
+
+if [[ ${#PROFILES[@]} -eq 0 ]]; then
+  gum style --foreground 9 "No Chromium profiles were detected."
+  sleep 3
+  exit 1
+fi
+
+declare -A NAME_COUNTS
+for p in "${PROFILES[@]}"; do
+  name="${p#*|}"
+  ((NAME_COUNTS["$name"]++))
+done
+
+declare -A PROFILE_MAP
+declare -a DISPLAY_LIST
+
+for p in "${PROFILES[@]}"; do
+  dir="${p%%|*}"
+  name="${p#*|}"
+  if [[ ${NAME_COUNTS["$name"]} -gt 1 ]]; then
+    display="${name} — ${dir}"
+  else
+    display="${name}"
+  fi
+  PROFILE_MAP["$display"]="$dir"
+  DISPLAY_LIST+=("$display")
+done
+
+clear
+gum style --border normal --margin "1" --padding "1 2" --border-foreground 212 "Select Chromium Profile for $WEBAPP_NAME"
+
+SELECTED_NAME=$(gum choose --header "Profiles:" "${DISPLAY_LIST[@]}")
+if [[ $? -ne 0 || -z "$SELECTED_NAME" ]]; then
+  exit 0
+fi
+
+SELECTED_DIR="${PROFILE_MAP[$SELECTED_NAME]}"
+
+if gum confirm "Set this profile as default for $WEBAPP_NAME?"; then
+  tmp_file=$(mktemp)
+  if jq --arg key "$WEBAPP_KEY" --arg prof "$SELECTED_DIR" '.webapps[$key] = {"profile": $prof}' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$CONFIG_FILE"
+  else
+    rm -f "$tmp_file"
+  fi
+fi
+
+launch_app "$SELECTED_DIR"

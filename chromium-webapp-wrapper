@@ -1,0 +1,112 @@
+#!/bin/bash
+# Wrapper for Chromium to catch webapp launches
+
+is_webapp=false
+url=""
+has_profile_dir=false
+skip_next=false
+
+declare -a args=("$@")
+
+for arg in "${args[@]}"; do
+  if [[ "$skip_next" == true ]]; then
+    skip_next=false
+    continue
+  fi
+  if [[ "$arg" == --app=* ]]; then
+    url="${arg#--app=}"
+    if [[ -n "$url" ]]; then
+      is_webapp=true
+    fi
+  elif [[ "$arg" == --profile-directory=* ]]; then
+    has_profile_dir=true
+  elif [[ "$arg" == "--profile-directory" ]]; then
+    has_profile_dir=true
+    skip_next=true
+  fi
+done
+
+if [[ "$is_webapp" != true ]]; then
+  # Normal Chromium launch
+  exec /usr/bin/chromium "${args[@]}"
+fi
+
+# We are launching a webapp!
+WEBAPP_NAME=""
+
+if [[ -d "$HOME/.local/share/applications" ]]; then
+  for f in "$HOME/.local/share/applications"/*.desktop; do
+    if [[ -f "$f" ]]; then
+      if grep "^Exec=omarchy-launch-webapp " "$f" | grep -Fq "$url"; then
+        WEBAPP_NAME=$(grep "^Name=" "$f" | head -1 | cut -d= -f2)
+        break
+      fi
+    fi
+  done
+fi
+
+if [[ -z "$WEBAPP_NAME" ]]; then
+  WEBAPP_NAME=$(echo "$url" | awk -F/ '{print $3}')
+  if [[ -z "$WEBAPP_NAME" ]]; then
+    WEBAPP_NAME="Webapp"
+  fi
+fi
+
+# Stable internal key based on URL
+WEBAPP_KEY="$url"
+
+CONFIG_DIR="$HOME/.config/webapp-profile-selector"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+mkdir -p "$CONFIG_DIR"
+
+init_config() {
+  local tmp_file
+  tmp_file=$(mktemp)
+  echo '{"webapps": {}}' > "$tmp_file"
+  mv "$tmp_file" "$CONFIG_FILE"
+}
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  if ! jq -e '.webapps | type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    bak_file=$(mktemp "${CONFIG_FILE}.bak.XXXXXX")
+    cp -p "$CONFIG_FILE" "$bak_file" 2>/dev/null
+    init_config
+  fi
+else
+  init_config
+fi
+
+SAVED_PROFILE=$(jq -r --arg key "$WEBAPP_KEY" '.webapps[$key].profile // empty' "$CONFIG_FILE" 2>/dev/null)
+
+if [[ -z "$SAVED_PROFILE" ]]; then
+  # Migration logic: if old name-based key exists, migrate to URL-based key
+  OLD_PROFILE=$(jq -r --arg old "$WEBAPP_NAME" '.webapps[$old].profile // empty' "$CONFIG_FILE" 2>/dev/null)
+  if [[ -n "$OLD_PROFILE" ]]; then
+    tmp_file=$(mktemp)
+    if jq --arg old "$WEBAPP_NAME" --arg new "$WEBAPP_KEY" '.webapps[$new] = .webapps[$old] | del(.webapps[$old])' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+      mv "$tmp_file" "$CONFIG_FILE"
+      SAVED_PROFILE="$OLD_PROFILE"
+    else
+      rm -f "$tmp_file"
+    fi
+  fi
+fi
+
+LOCAL_STATE="$HOME/.config/chromium/Local State"
+if [[ -n "$SAVED_PROFILE" ]] && [[ -f "$LOCAL_STATE" ]]; then
+  PROFILE_EXISTS=$(jq -r --arg p "$SAVED_PROFILE" '.profile.info_cache | has($p)' "$LOCAL_STATE" 2>/dev/null)
+  if [[ "$PROFILE_EXISTS" != "true" ]]; then
+    SAVED_PROFILE=""
+  fi
+fi
+
+if [[ "$has_profile_dir" == true ]]; then
+  # Honor existing profile arg without re-prompting
+  exec /usr/bin/chromium "${args[@]}"
+fi
+
+if [[ -n "$SAVED_PROFILE" ]]; then
+  exec /usr/bin/chromium --profile-directory="$SAVED_PROFILE" "${args[@]}"
+else
+  exec omarchy launch tui --app-id=webapp-profile-selector webapp-profile-selector-tui "$WEBAPP_NAME" "$WEBAPP_KEY" "${args[@]}"
+fi
