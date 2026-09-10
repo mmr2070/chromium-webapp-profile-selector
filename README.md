@@ -2,6 +2,8 @@
 
 A lightweight **OmarchyOS plugin** that lets each Chromium webapp use its own Chromium profile. Works transparently through the existing Omarchy webapp launcher — no daemons, no background services, no PATH manipulation.
 
+![Profile selector TUI showing a list of Chromium profiles to choose from](screenshots/profile-selector.png)
+
 ---
 
 ## Features
